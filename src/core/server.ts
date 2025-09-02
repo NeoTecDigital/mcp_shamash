@@ -48,10 +48,12 @@ export class ShamashServer {
     this.boundaryEnforcer = new BoundaryEnforcer();
     this.tokenManager = new TokenManager();
     this.auditLogger = new AuditLogger();
-    this.projectScanner = new ProjectScanner(this.boundaryEnforcer);
-    this.networkScanner = new NetworkScanner(this.boundaryEnforcer);
-    this.pentestScanner = new PentestScanner(this.boundaryEnforcer);
     this.complianceValidator = new ComplianceValidator();
+    
+    // Scanners will be initialized after boundary enforcer is ready
+    this.projectScanner = null as any;
+    this.networkScanner = null as any;
+    this.pentestScanner = null as any;
 
     this.setupHandlers();
   }
@@ -358,6 +360,11 @@ export class ShamashServer {
   async start(): Promise<void> {
     // Initialize boundary enforcer with project scope
     await this.boundaryEnforcer.initialize();
+
+    // Now create scanners with initialized boundary enforcer
+    this.projectScanner = new ProjectScanner(this.boundaryEnforcer);
+    this.networkScanner = new NetworkScanner(this.boundaryEnforcer);
+    this.pentestScanner = new PentestScanner(this.boundaryEnforcer);
 
     // Initialize scanners
     await this.projectScanner.initialize();
