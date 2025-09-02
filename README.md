@@ -8,9 +8,12 @@ A Model Context Protocol (MCP) server for security auditing, penetration testing
 - **Multiple Security Tools**: Semgrep, Trivy, Gitleaks, OWASP ZAP, and more
 - **Network Penetration Testing**: Safe network scanning within project scope
 - **Compliance Validation**: OWASP, CIS, NIST, ISO 27001 frameworks
-- **Containerized Execution**: Isolated scanner execution
-- **Token Efficiency**: <1000 tokens per operation
+- **Containerized Execution**: Isolated scanner execution with Docker
+- **Parallel Processing**: Concurrent scanner execution for speed
+- **Intelligent Caching**: Results cached for performance optimization
+- **Token Efficiency**: <1000 tokens per operation with monitoring
 - **Comprehensive Audit Logging**: Complete operation trails
+- **Real-Time Boundary Enforcement**: Multi-layer security isolation
 
 ## Quick Start
 
@@ -32,6 +35,22 @@ Or for development:
 ```bash
 npm run dev
 ```
+
+### Demo
+
+Experience all features with the interactive demo:
+
+```bash
+node demo.js
+```
+
+This demonstrates:
+- Real security tool integration (Semgrep, Trivy, Gitleaks, OWASP ZAP)
+- Boundary enforcement (prevents external access)
+- Network scanning within project scope
+- Compliance validation (OWASP, CIS, NIST)
+- Caching performance improvements
+- Parallel scanner execution
 
 ### MCP Integration
 

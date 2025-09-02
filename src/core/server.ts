@@ -359,6 +359,9 @@ export class ShamashServer {
     // Initialize boundary enforcer with project scope
     await this.boundaryEnforcer.initialize();
 
+    // Initialize scanners
+    await this.projectScanner.initialize();
+
     // Start server
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
