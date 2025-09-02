@@ -1,0 +1,34 @@
+# Base scanner container with security hardening
+FROM node:20-alpine AS base
+
+# Security: Create non-root user
+RUN addgroup -g 65534 scanner && \
+    adduser -D -u 65534 -G scanner -s /bin/sh scanner
+
+# Security: Install minimal packages only
+RUN apk add --no-cache \
+    curl \
+    ca-certificates \
+    && rm -rf /var/cache/apk/*
+
+# Security: Set up read-only filesystem structure
+WORKDIR /scanner
+RUN mkdir -p /tmp/scanner /var/scanner && \
+    chown -R scanner:scanner /scanner /tmp/scanner /var/scanner
+
+# Copy scanner utilities
+COPY --chown=scanner:scanner containers/scanner-utils.sh /usr/local/bin/
+
+# Switch to non-root user
+USER scanner
+
+# Security: Disable network access by default
+# (Will be enabled per-scanner with specific network configs)
+ENV NO_PROXY="*"
+ENV no_proxy="*"
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD echo "Scanner base healthy"
+
+ENTRYPOINT ["/bin/sh"]

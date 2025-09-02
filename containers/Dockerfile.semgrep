@@ -1,0 +1,43 @@
+# SAST Scanner - Semgrep
+FROM returntocorp/semgrep:latest AS semgrep-base
+
+# Switch to our scanner base
+FROM node:20-alpine
+
+# Security: Create non-root user
+RUN addgroup -g 65534 scanner && \
+    adduser -D -u 65534 -G scanner -s /bin/sh scanner
+
+# Install Python (required for Semgrep)
+RUN apk add --no-cache python3 py3-pip && \
+    pip3 install semgrep==1.45.0
+
+# Copy semgrep binary from official image
+COPY --from=semgrep-base /usr/local/bin/semgrep /usr/local/bin/
+
+# Security: Set up directories
+WORKDIR /scanner
+RUN mkdir -p /tmp/scanner /var/scanner && \
+    chown -R scanner:scanner /scanner /tmp/scanner /var/scanner
+
+# Copy scanner utilities
+COPY --chown=scanner:scanner containers/scanner-utils.sh /usr/local/bin/
+
+# Switch to non-root user
+USER scanner
+
+# Scanner configuration
+ENV SEMGREP_TIMEOUT=300
+ENV SEMGREP_MAX_MEMORY=1073741824
+ENV SEMGREP_SEND_METRICS=off
+ENV SEMGREP_VERSION_CHECK=off
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD semgrep --version || exit 1
+
+# Entrypoint script
+COPY --chown=scanner:scanner containers/semgrep-entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
