@@ -115,6 +115,32 @@ services:
     restart: "no"
     command: ["zap-api-scan.py", "-t", "${SHAMASH_TARGET_URL}", "-f", "json", "-J", "/zap/wrk/zap-results.json"]
 
+  # Checkov IaC Security Scanner
+  checkov:
+    image: bridgecrew/checkov:latest
+    networks:
+      - shamash_sandbox
+    environment:
+      - CHECKOV_LOG_LEVEL=ERROR
+      - SHAMASH_ALLOWED_NETWORKS=172.29.0.0/16,127.0.0.1/32
+    volumes:
+      - type: bind
+        source: ${SHAMASH_TARGET_PATH:-./}
+        target: /scan/target
+        read_only: true
+      - scanner_results:/var/scanner
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m
+    mem_limit: 1g
+    cpus: 1.0
+    restart: "no"
+    command: ["checkov", "--directory=/scan/target", "--output=json", "--quiet", "--framework=dockerfile,docker_compose,kubernetes", "--skip-check=CKV_DOCKER_2", "--compact", "--no-guide"]
+
 networks:
   # Isolated scanner network
   shamash_sandbox:

@@ -5,10 +5,12 @@ import type { BoundaryEnforcer } from '../boundaries/enforcer.js';
 import { DockerOrchestrator, type ScannerConfig } from './docker-orchestrator.js';
 import { ResultCache } from '../cache/result-cache.js';
 import { ScannerExecutor } from '../utils/parallel-executor.js';
+import { CustomRuleEngine } from '../rules/custom-rule-engine.js';
 
 export class ProjectScanner {
   private orchestrator: DockerOrchestrator;
   private cache: ResultCache;
+  private customRuleEngine: CustomRuleEngine;
 
   constructor(private boundaryEnforcer: BoundaryEnforcer) {
     const projectScope = this.boundaryEnforcer.getProjectScope();
@@ -17,10 +19,12 @@ export class ProjectScanner {
     }
     this.orchestrator = new DockerOrchestrator(projectScope);
     this.cache = new ResultCache();
+    this.customRuleEngine = new CustomRuleEngine(projectScope.projectRoot);
   }
 
   async initialize(): Promise<void> {
     await this.cache.initialize();
+    await this.customRuleEngine.loadRules();
   }
 
   async scan(request: ScanRequest): Promise<ScanResult> {
@@ -310,6 +314,427 @@ export class ProjectScanner {
     };
   }
 
+  private async runNuclei(targetPath: string): Promise<{ findings: Finding[]; tokenUsage: number }> {
+    const config: ScannerConfig = {
+      image: 'projectdiscovery/nuclei:latest',
+      command: [
+        'nuclei',
+        '-target', '/scan/target',
+        '-json',
+        '-silent',
+        '-severity', 'critical,high,medium',
+        '-type', 'file',
+        '-disable-update-check'
+      ],
+      environment: {
+        HOME: '/tmp'
+      },
+      volumes: [],
+      resourceLimits: {
+        memory: 2 * 1024 * 1024 * 1024, // 2GB
+        cpus: 2,
+        pidsLimit: 150,
+      },
+      timeout: 600000, // 10 minutes
+    };
+
+    const result = await this.orchestrator.runScanner('nuclei', config, targetPath);
+    
+    if (result.exitCode !== 0 && result.exitCode !== 1) {
+      throw new Error(`Nuclei failed with exit code ${result.exitCode}: ${result.stderr}`);
+    }
+
+    return this.parseNucleiOutput(result.stdout);
+  }
+
+  private parseNucleiOutput(output: string): { findings: Finding[]; tokenUsage: number } {
+    const findings: Finding[] = [];
+    
+    try {
+      const lines = output.trim().split('\n').filter(line => line);
+      
+      for (const line of lines) {
+        try {
+          const nucleiResult = JSON.parse(line);
+          
+          findings.push({
+            id: `nuclei_${nucleiResult.template_id}_${Date.now()}`,
+            type: 'vulnerability',
+            severity: this.mapNucleiSeverity(nucleiResult.info?.severity || 'medium'),
+            title: nucleiResult.info?.name || nucleiResult.template_id,
+            description: nucleiResult.info?.description || 'Vulnerability detected by Nuclei',
+            location: {
+              file: nucleiResult.matched_at || nucleiResult.host,
+            },
+            cve: nucleiResult.info?.cve?.join(', '),
+            cvssScore: nucleiResult.info?.cvss_score,
+            remediation: nucleiResult.info?.remediation || 'Review and fix the identified vulnerability',
+          });
+        } catch (err) {
+          // Skip malformed lines
+        }
+      }
+    } catch (error) {
+      console.error('Failed to parse Nuclei output:', error);
+    }
+
+    return {
+      findings,
+      tokenUsage: Math.min(findings.length * 12 + 60, 350)
+    };
+  }
+
+  private mapNucleiSeverity(severity: string): 'critical' | 'high' | 'medium' | 'low' | 'informational' {
+    switch (severity?.toLowerCase()) {
+      case 'critical': return 'critical';
+      case 'high': return 'high';
+      case 'medium': return 'medium';
+      case 'low': return 'low';
+      case 'info': return 'informational';
+      default: return 'medium';
+    }
+  }
+
+  private async runBandit(targetPath: string): Promise<{ findings: Finding[]; tokenUsage: number }> {
+    const config: ScannerConfig = {
+      image: 'secfigo/bandit:latest',
+      command: [
+        'bandit',
+        '-r', '/scan/target',
+        '-f', 'json',
+        '--severity-level', 'low',
+        '--confidence-level', 'low'
+      ],
+      environment: {},
+      volumes: [],
+      resourceLimits: {
+        memory: 1 * 1024 * 1024 * 1024, // 1GB
+        cpus: 1,
+        pidsLimit: 100,
+      },
+      timeout: 300000, // 5 minutes
+    };
+
+    const result = await this.orchestrator.runScanner('bandit', config, targetPath);
+    
+    if (result.exitCode !== 0 && result.exitCode !== 1) {
+      throw new Error(`Bandit failed with exit code ${result.exitCode}: ${result.stderr}`);
+    }
+
+    return this.parseBanditOutput(result.stdout);
+  }
+
+  private parseBanditOutput(output: string): { findings: Finding[]; tokenUsage: number } {
+    const findings: Finding[] = [];
+    
+    try {
+      const banditResults = JSON.parse(output);
+      
+      if (banditResults.results) {
+        for (const result of banditResults.results) {
+          findings.push({
+            id: `bandit_${result.test_id}_${Date.now()}`,
+            type: 'sast',
+            severity: this.mapBanditSeverity(result.issue_severity),
+            title: `${result.test_name}: ${result.issue_text}`,
+            description: result.issue_text,
+            location: {
+              file: result.filename,
+              line: result.line_number,
+              column: result.col_offset,
+            },
+            remediation: result.issue_cwe ? `Review CWE-${result.issue_cwe.id}` : 'Review and fix the security issue',
+          });
+        }
+      }
+    } catch (error) {
+      console.error('Failed to parse Bandit output:', error);
+    }
+
+    return {
+      findings,
+      tokenUsage: Math.min(findings.length * 10 + 40, 250)
+    };
+  }
+
+  private mapBanditSeverity(severity: string): 'critical' | 'high' | 'medium' | 'low' | 'informational' {
+    switch (severity?.toUpperCase()) {
+      case 'HIGH': return 'high';
+      case 'MEDIUM': return 'medium';
+      case 'LOW': return 'low';
+      default: return 'informational';
+    }
+  }
+
+  private async runGrype(targetPath: string): Promise<{ findings: Finding[]; tokenUsage: number }> {
+    const config: ScannerConfig = {
+      image: 'anchore/grype:latest',
+      command: [
+        'grype',
+        'dir:/scan/target',
+        '-o', 'json',
+        '--quiet'
+      ],
+      environment: {
+        GRYPE_DB_AUTO_UPDATE: 'false'
+      },
+      volumes: [],
+      resourceLimits: {
+        memory: 2 * 1024 * 1024 * 1024, // 2GB
+        cpus: 2,
+        pidsLimit: 100,
+      },
+      timeout: 600000, // 10 minutes
+    };
+
+    const result = await this.orchestrator.runScanner('grype', config, targetPath);
+    
+    if (result.exitCode !== 0 && result.exitCode !== 1) {
+      throw new Error(`Grype failed with exit code ${result.exitCode}: ${result.stderr}`);
+    }
+
+    return this.parseGrypeOutput(result.stdout);
+  }
+
+  private parseGrypeOutput(output: string): { findings: Finding[]; tokenUsage: number } {
+    const findings: Finding[] = [];
+    
+    try {
+      const grypeResults = JSON.parse(output);
+      
+      if (grypeResults.matches) {
+        for (const match of grypeResults.matches) {
+          const vuln = match.vulnerability;
+          findings.push({
+            id: `grype_${vuln.id}_${Date.now()}`,
+            type: 'dependency',
+            severity: this.mapGrypeSeverity(vuln.severity),
+            title: `${vuln.id}: ${match.artifact.name}@${match.artifact.version}`,
+            description: vuln.description || `Vulnerability in ${match.artifact.name}`,
+            location: {
+              file: match.artifact.locations?.[0]?.path,
+            },
+            cve: vuln.id,
+            cvssScore: vuln.cvss?.[0]?.metrics?.baseScore,
+            remediation: vuln.fix?.versions ? `Update to version ${vuln.fix.versions[0]}` : 'Update to a patched version',
+          });
+        }
+      }
+    } catch (error) {
+      console.error('Failed to parse Grype output:', error);
+    }
+
+    return {
+      findings,
+      tokenUsage: Math.min(findings.length * 15 + 70, 400)
+    };
+  }
+
+  private mapGrypeSeverity(severity: string): 'critical' | 'high' | 'medium' | 'low' | 'informational' {
+    switch (severity?.toLowerCase()) {
+      case 'critical': return 'critical';
+      case 'high': return 'high';
+      case 'medium': return 'medium';
+      case 'low': return 'low';
+      case 'negligible': return 'informational';
+      default: return 'medium';
+    }
+  }
+
+  private async runCustomRules(targetPath: string): Promise<{ findings: Finding[]; tokenUsage: number }> {
+    console.error('Running custom rules scan...');
+    
+    try {
+      const result = await this.customRuleEngine.scanWithCustomRules(targetPath);
+      console.error(`Custom rules scan completed: ${result.findings.length} findings`);
+      return result;
+    } catch (error) {
+      console.error('Custom rules scan failed:', error);
+      return {
+        findings: [],
+        tokenUsage: 10
+      };
+    }
+  }
+
+  private async runOwaspDependencyCheck(targetPath: string): Promise<{ findings: Finding[]; tokenUsage: number }> {
+    console.error('Running OWASP Dependency-Check scan...');
+    
+    const config: ScannerConfig = {
+      image: 'owasp/dependency-check:latest',
+      command: [
+        '/usr/share/dependency-check/bin/dependency-check.sh',
+        '--scan', '/scan/target',
+        '--out', '/scan/target',
+        '--format', 'JSON',
+        '--enableRetired',
+        '--enableExperimental',
+        '--disableAssembly',
+        '--disableAutoconf',
+        '--disableBundleAudit',
+        '--disableCmake'
+      ],
+      environment: {},
+      volumes: [],
+      resourceLimits: {
+        memory: 4 * 1024 * 1024 * 1024, // 4GB
+        cpus: 2,
+        pidsLimit: 100,
+      },
+      timeout: 1800000, // 30 minutes
+    };
+
+    const result = await this.orchestrator.runScanner('owasp_dependency_check', config, targetPath);
+    
+    if (result.exitCode !== 0) {
+      console.error(`OWASP Dependency-Check failed with exit code ${result.exitCode}: ${result.stderr}`);
+      return {
+        findings: [],
+        tokenUsage: 25
+      };
+    }
+
+    return this.parseOwaspDependencyCheckOutput(result.stdout, targetPath);
+  }
+
+  private parseOwaspDependencyCheckOutput(output: string, _targetPath: string): { findings: Finding[]; tokenUsage: number } {
+    const findings: Finding[] = [];
+    
+    try {
+      // Since we can't read from the container, parse stdout if it contains JSON
+      let reportData;
+      
+      if (output.trim().startsWith('{')) {
+        reportData = JSON.parse(output);
+      } else {
+        // No JSON output available
+        console.error('No JSON report available from OWASP Dependency-Check');
+        return { findings, tokenUsage: 25 };
+      }
+      
+      if (reportData.dependencies) {
+        for (const dependency of reportData.dependencies) {
+          if (dependency.vulnerabilities) {
+            for (const vuln of dependency.vulnerabilities) {
+              findings.push({
+                id: `owasp_dep_check_${vuln.name}_${Date.now()}`,
+                type: 'dependency',
+                severity: this.mapOwaspDcSeverity(vuln.severity),
+                title: `${vuln.name}: ${dependency.fileName}`,
+                description: vuln.description || `Vulnerability in dependency ${dependency.fileName}`,
+                location: {
+                  file: dependency.filePath || dependency.fileName,
+                },
+                cve: vuln.name,
+                cvssScore: vuln.cvssv3?.baseScore || vuln.cvssv2?.score,
+                remediation: vuln.notes || 'Update to a patched version of this dependency',
+              });
+            }
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Failed to parse OWASP Dependency-Check output:', error);
+    }
+
+    return {
+      findings,
+      tokenUsage: Math.min(findings.length * 20 + 50, 500)
+    };
+  }
+
+  private mapOwaspDcSeverity(severity: string): 'critical' | 'high' | 'medium' | 'low' | 'informational' {
+    switch (severity?.toLowerCase()) {
+      case 'critical': return 'critical';
+      case 'high': return 'high';
+      case 'medium': return 'medium';
+      case 'low': return 'low';
+      default: return 'medium';
+    }
+  }
+
+  private async runCheckov(targetPath: string): Promise<{ findings: Finding[]; tokenUsage: number }> {
+    const config: ScannerConfig = {
+      image: 'bridgecrew/checkov:latest',
+      command: [
+        'checkov',
+        '--directory=/scan/target',
+        '--output=json',
+        '--quiet',
+        '--framework=dockerfile,docker_compose,kubernetes',
+        '--skip-check=CKV_DOCKER_2', // Skip healthcheck requirement for security scanners
+        '--compact',
+        '--no-guide'
+      ],
+      environment: {
+        CHECKOV_LOG_LEVEL: 'ERROR'
+      },
+      volumes: [],
+      resourceLimits: {
+        memory: 1 * 1024 * 1024 * 1024, // 1GB
+        cpus: 1,
+        pidsLimit: 100,
+      },
+      timeout: 300000, // 5 minutes
+    };
+
+    const result = await this.orchestrator.runScanner('checkov', config, targetPath);
+    
+    // Checkov returns 1 when findings found, 0 when none found
+    if (result.exitCode !== 0 && result.exitCode !== 1) {
+      throw new Error(`Checkov failed with exit code ${result.exitCode}: ${result.stderr}`);
+    }
+
+    return this.parseCheckovOutput(result.stdout);
+  }
+
+  private parseCheckovOutput(output: string): { findings: Finding[]; tokenUsage: number } {
+    const findings: Finding[] = [];
+    
+    try {
+      const checkovResults = JSON.parse(output);
+      
+      if (checkovResults.results && checkovResults.results.failed_checks) {
+        for (const check of checkovResults.results.failed_checks) {
+          findings.push({
+            id: `checkov_${check.check_id}_${Date.now()}`,
+            type: 'infrastructure',
+            severity: this.mapCheckovSeverity(check.severity || 'MEDIUM'),
+            title: `${check.check_id}: ${check.check_name}`,
+            description: check.description || check.check_name,
+            location: {
+              file: check.file_path,
+              line: check.file_line_range ? check.file_line_range[0] : undefined,
+            },
+            remediation: check.guideline || 'Review and fix the infrastructure security issue',
+          });
+        }
+      }
+    } catch (error) {
+      console.error('Failed to parse Checkov output:', error);
+    }
+
+    return {
+      findings,
+      tokenUsage: Math.min(findings.length * 15 + 50, 300) // Estimate token usage
+    };
+  }
+
+  private mapCheckovSeverity(severity: string): 'critical' | 'high' | 'medium' | 'low' | 'informational' {
+    switch (severity?.toUpperCase()) {
+      case 'CRITICAL':
+        return 'critical';
+      case 'HIGH':
+        return 'high';
+      case 'MEDIUM':
+        return 'medium';
+      case 'LOW':
+        return 'low';
+      default:
+        return 'medium'; // Default IaC issues to medium
+    }
+  }
+
   private mapSemgrepSeverity(severity: string): 'critical' | 'high' | 'medium' | 'low' | 'informational' {
     switch (severity?.toUpperCase()) {
       case 'ERROR':
@@ -358,11 +783,13 @@ export class ProjectScanner {
   private getDefaultTools(profile?: string): string[] {
     switch (profile) {
       case 'quick':
-        return ['gitleaks'];
+        return ['gitleaks', 'custom_rules'];
       case 'thorough':
-        return ['semgrep', 'trivy', 'gitleaks'];
+        return ['semgrep', 'trivy', 'gitleaks', 'checkov', 'nuclei', 'bandit', 'grype', 'owasp_dependency_check', 'custom_rules'];
+      case 'comprehensive':
+        return ['semgrep', 'trivy', 'gitleaks', 'checkov', 'nuclei', 'grype', 'owasp_dependency_check', 'custom_rules'];
       default: // standard
-        return ['semgrep', 'trivy'];
+        return ['semgrep', 'trivy', 'checkov', 'custom_rules'];
     }
   }
 
@@ -394,6 +821,18 @@ export class ProjectScanner {
         return await this.runTrivy(targetPath);
       case 'gitleaks':
         return await this.runGitleaks(targetPath);
+      case 'checkov':
+        return await this.runCheckov(targetPath);
+      case 'nuclei':
+        return await this.runNuclei(targetPath);
+      case 'bandit':
+        return await this.runBandit(targetPath);
+      case 'grype':
+        return await this.runGrype(targetPath);
+      case 'custom_rules':
+        return await this.runCustomRules(targetPath);
+      case 'owasp_dependency_check':
+        return await this.runOwaspDependencyCheck(targetPath);
       default:
         throw new Error(`Unknown scanner tool: ${tool}`);
     }
@@ -403,11 +842,23 @@ export class ProjectScanner {
     // Higher priority for faster scanners
     switch (tool) {
       case 'gitleaks':
-        return 3; // Fastest - secrets scanning
+        return 6; // Fastest - secrets scanning
+      case 'checkov':
+        return 5; // Fast - IaC scanning
+      case 'bandit':
+        return 4; // Fast - Python SAST
       case 'semgrep':
-        return 2; // Fast - SAST
+        return 3; // Fast - SAST
       case 'trivy':
-        return 1; // Slower - dependency scanning
+        return 2; // Slower - dependency scanning
+      case 'grype':
+        return 1; // Slow - comprehensive dependency scanning
+      case 'nuclei':
+        return 0; // Slowest - vulnerability scanning
+      case 'custom_rules':
+        return 4; // Fast - local pattern matching
+      case 'owasp_dependency_check':
+        return 1; // Slow - comprehensive dependency analysis
       default:
         return 0;
     }
@@ -418,10 +869,22 @@ export class ProjectScanner {
     switch (tool) {
       case 'gitleaks':
         return 300000; // 5 minutes
+      case 'checkov':
+        return 300000; // 5 minutes - IaC scanning is usually fast
+      case 'bandit':
+        return 300000; // 5 minutes - Python SAST is fast
       case 'semgrep':
         return 600000; // 10 minutes
       case 'trivy':
         return 900000; // 15 minutes (can be slow for large projects)
+      case 'grype':
+        return 900000; // 15 minutes - comprehensive scanning
+      case 'nuclei':
+        return 1200000; // 20 minutes - extensive template scanning
+      case 'custom_rules':
+        return 120000; // 2 minutes - fast local scanning
+      case 'owasp_dependency_check':
+        return 1800000; // 30 minutes - thorough dependency analysis
       default:
         return 600000;
     }

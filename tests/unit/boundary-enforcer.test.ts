@@ -1,6 +1,6 @@
 import { BoundaryEnforcer } from '../../src/boundaries/enforcer';
 import * as fs from 'fs/promises';
-import * as path from 'path';
+// import * as path from 'path';
 
 // Mock fs module
 jest.mock('fs/promises');
@@ -17,7 +17,7 @@ describe('BoundaryEnforcer', () => {
     jest.spyOn(process, 'cwd').mockReturnValue(testProjectRoot);
     
     // Mock fs operations
-    mockedFs.readFile.mockImplementation((filePath: string) => {
+    mockedFs.readFile.mockImplementation(((filePath: string) => {
       if (filePath.includes('docker-compose.yml')) {
         return Promise.resolve(`
 version: '3.8'
@@ -39,7 +39,7 @@ networks:
         return Promise.resolve('{"name": "test-project", "version": "1.0.0"}');
       }
       return Promise.reject(new Error('ENOENT'));
-    });
+    }) as any);
 
     mockedFs.stat.mockImplementation(() => 
       Promise.reject(new Error('ENOENT'))
