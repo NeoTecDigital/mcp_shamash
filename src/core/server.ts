@@ -16,6 +16,7 @@ import { AuditLogger } from '../utils/audit-logger.js';
 import { ProjectScanner } from '../scanners/project-scanner.js';
 import { NetworkScanner } from '../scanners/network-scanner.js';
 import { PentestScanner } from '../scanners/pentest-scanner.js';
+import { WebsiteScanner } from '../scanners/website-scanner.js';
 import { ComplianceValidator } from '../compliance/validator.js';
 import { IncrementalScanner } from '../scanners/incremental-scanner.js';
 import { RemediationAdvisor } from '../advisor/remediation-advisor.js';
@@ -30,6 +31,7 @@ export class ShamashServer {
   private projectScanner: ProjectScanner;
   private networkScanner: NetworkScanner;
   private pentestScanner: PentestScanner;
+  private websiteScanner: WebsiteScanner;
   private complianceValidator: ComplianceValidator;
   private incrementalScanner: IncrementalScanner;
   private remediationAdvisor: RemediationAdvisor;
@@ -61,6 +63,7 @@ export class ShamashServer {
     this.projectScanner = null as any;
     this.networkScanner = null as any;
     this.pentestScanner = null as any;
+    this.websiteScanner = null as any;
     this.incrementalScanner = null as any;
     this.falsePositiveFilter = null as any;
 
@@ -125,6 +128,31 @@ export class ShamashServer {
                 type: 'string',
                 enum: ['quick', 'standard', 'thorough'],
                 description: 'Testing depth'
+              },
+            },
+            required: ['targetUrl'],
+          },
+        },
+        {
+          name: 'pentest_website',
+          description: 'Performs security testing on web applications via HTTP/HTTPS. Supports external URLs with authorization. Tests security headers, SSL/TLS, information disclosure, cookies, CORS, and more.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              targetUrl: { type: 'string', description: 'Website URL to test (http:// or https://)' },
+              testTypes: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Tests to run: security_headers, ssl_tls, information_disclosure, directory_listing, cookie_security, http_methods, cors_check, clickjacking, server_fingerprint, ssl_cipher_analysis, error_handling, open_redirect, mixed_content, waf_detection, authentication_check, session_analysis, api_exposure, subdomain_headers',
+              },
+              depth: {
+                type: 'string',
+                enum: ['quick', 'standard', 'thorough'],
+                description: 'Testing depth (default: standard)',
+              },
+              authorized: {
+                type: 'boolean',
+                description: 'Confirm authorization to test external targets (required for non-local URLs)',
               },
             },
             required: ['targetUrl'],
@@ -264,6 +292,10 @@ export class ShamashServer {
 
           case 'pentest_application':
             result = await this.handlePentest(args);
+            break;
+
+          case 'pentest_website':
+            result = await this.handleWebsitePentest(args);
             break;
 
           case 'check_compliance':
@@ -483,6 +515,29 @@ export class ShamashServer {
     };
 
     return await this.pentestScanner.scan(request);
+  }
+
+  private async handleWebsitePentest(args: any): Promise<ScanResult> {
+    const { targetUrl, testTypes = [], depth = 'standard', authorized = false } = args;
+
+    // Validate URL with external authorization support
+    const validation = await this.boundaryEnforcer.validateExternalUrl(targetUrl, authorized);
+    if (!validation.allowed) {
+      throw new McpError(ErrorCode.InvalidRequest, validation.reason || 'URL validation failed');
+    }
+
+    const request: ScanRequest = {
+      type: 'website',
+      target: targetUrl,
+      profile: depth,
+      tools: testTypes.length > 0 ? testTypes : undefined,
+      options: {
+        maxTokens: this.tokenManager.getRemainingTokens(),
+        maxDuration: 5 * 60 * 1000, // 5 minutes
+      },
+    };
+
+    return await this.websiteScanner.scan(request);
   }
 
   private async handleComplianceCheck(args: any): Promise<any> {
@@ -721,7 +776,8 @@ export class ShamashServer {
     this.projectScanner = new ProjectScanner(this.boundaryEnforcer);
     this.networkScanner = new NetworkScanner(this.boundaryEnforcer);
     this.pentestScanner = new PentestScanner(this.boundaryEnforcer);
-    
+    this.websiteScanner = new WebsiteScanner(this.boundaryEnforcer);
+
     // Initialize Sprint 5 features
     this.incrementalScanner = new IncrementalScanner(projectRoot, this.projectScanner);
     this.falsePositiveFilter = new FalsePositiveFilter(projectRoot);
